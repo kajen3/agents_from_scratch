@@ -1,17 +1,20 @@
 """Textual TUI for the agent: conversation, live tool calls, status, input.
 
-`run_agent` is synchronous, so it runs in a thread worker. Its events are
+`run_agent` is synchronous, so it runs in a background thread. Its events are
 marshalled onto the UI thread with `call_from_thread`; widgets are only ever
 touched from the UI thread.
 """
 
+import threading
+from collections.abc import Callable
+from concurrent.futures import CancelledError
 from typing import Protocol
 
 from rich.text import Text
-from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
+from textual.css.query import NoMatches
 from textual.widgets import Footer, Input, Markdown, Static
 
 from agents_from_scratch import agent
@@ -78,7 +81,7 @@ class AgentApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("enter", "focus_input", "Send"),
+        Binding("enter", "submit", "Send"),
         Binding("ctrl+c", "quit", "Quit", priority=True),
         Binding("pageup", "scroll_conversation('up')", "PgUp/PgDn scroll"),
         Binding("pagedown", "scroll_conversation('down')", show=False),
@@ -94,6 +97,7 @@ class AgentApp(App[None]):
         self.max_turns = max_turns
         self.messages: list[Message] = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.running = False
+        self.turn_thread: threading.Thread | None = None
         self._current_tool: ToolLine | None = None
 
     def compose(self) -> ComposeResult:
@@ -109,11 +113,16 @@ class AgentApp(App[None]):
         self.query_one("#tools").border_title = "Tools"
         self.query_one("#prompt").border_title = "Message"
         self.query_one("#prompt").focus()
+        # Stay scrolled to the bottom as content (incl. Markdown, which lays
+        # out its children asynchronously) is added, until the user scrolls up.
+        self.query_one("#conversation", VerticalScroll).anchor()
 
     # --- actions -----------------------------------------------------------
 
-    def action_focus_input(self) -> None:
-        self.query_one("#prompt").focus()
+    async def action_submit(self) -> None:
+        # The focused Input handles Enter itself; this makes Enter send the
+        # typed message even when focus is elsewhere (e.g. the conversation).
+        await self.query_one("#prompt", Input).action_submit()
 
     def action_scroll_conversation(self, direction: str) -> None:
         conversation = self.query_one("#conversation", VerticalScroll)
@@ -126,36 +135,45 @@ class AgentApp(App[None]):
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
-        if not text or self.running:
-            return  # keep the typed text while the agent is busy
+        if not text:
+            return
+        if self.running:
+            self.notify("Agent is busy…")  # keep the typed text
+            return
         event.input.clear()
-        self.running = True
-        self.set_status("Running…")
         await self.add_to_conversation(Static(text, classes="user", markup=False))
+        history_length = len(self.messages)  # restore point if the turn fails
         self.messages.append({"role": "user", "content": text})
-        self.run_turns()
+        self.set_status("Running…")
+        self.running = True
+        self.run_turns(history_length)
 
-    # --- agent worker (thread) ---------------------------------------------
+    # --- agent thread --------------------------------------------------------
 
-    @work(thread=True, exclusive=True)
-    def run_turns(self) -> None:
+    def run_turns(self, history_length: int) -> None:
+        # A daemon thread rather than a Textual thread worker: workers are
+        # joined on shutdown, so quitting mid-run would block until a slow
+        # LLM call or command finished (up to 120 s). A thread can't be
+        # cancelled, but a daemon one doesn't keep the process alive.
         def on_event(event: AgentEvent) -> None:
             self.call_from_thread(self.handle_event, event)
 
-        try:
-            _, self.messages = self.agent_fn(
-                self.messages, self.max_turns, on_event=on_event
-            )
-        except Exception as e:  # keep the app alive: show it and go idle
+        def finish(callback: Callable[..., object], *args: object) -> None:
             try:
-                self.call_from_thread(self.show_error, e)
-            except RuntimeError:
+                self.call_from_thread(callback, *args)
+            except RuntimeError, CancelledError, NoMatches:
                 pass  # the app is already gone
-        finally:
+
+        def run() -> None:
             try:
-                self.call_from_thread(self.set_idle)
-            except RuntimeError:
-                pass
+                self.agent_fn(self.messages, self.max_turns, on_event=on_event)
+            except Exception as e:  # keep the app alive: show it and go idle
+                finish(self.show_error, e, history_length)
+            finally:
+                finish(self.set_idle)
+
+        self.turn_thread = threading.Thread(target=run, daemon=True)
+        self.turn_thread.start()
 
     # --- UI-thread handlers ------------------------------------------------
 
@@ -173,11 +191,12 @@ class AgentApp(App[None]):
                     self._current_tool.set_state("-ok" if exit_code == 0 else "-err")
                     self._current_tool = None
             case Final(answer):
-                await self.add_to_conversation(Markdown(answer))
+                await self.add_to_conversation(Markdown(answer, open_links=False))
             case _:
                 pass
 
-    async def show_error(self, error: Exception) -> None:
+    async def show_error(self, error: Exception, history_length: int) -> None:
+        del self.messages[history_length:]  # drop the failed turn's messages
         if self._current_tool is not None:  # the tool died mid-run
             self._current_tool.set_state("-err")
             self._current_tool = None
@@ -194,7 +213,6 @@ class AgentApp(App[None]):
     async def add_to_conversation(self, widget: Static | Markdown) -> None:
         conversation = self.query_one("#conversation", VerticalScroll)
         await conversation.mount(widget)
-        conversation.scroll_end(animate=False)
 
 
 def main() -> None:

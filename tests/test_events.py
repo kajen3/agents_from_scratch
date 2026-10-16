@@ -1,5 +1,6 @@
 """run_agent reports progress as typed events instead of printing."""
 
+import subprocess
 from collections.abc import Callable
 
 import pytest
@@ -62,8 +63,6 @@ def test_run_out_of_turns_still_emits_final(
 
 
 def test_timeout_still_closes_the_tool_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    import subprocess
-
     def boom(*_a: object, **_k: object) -> None:
         raise subprocess.TimeoutExpired("sleep", 120)
 

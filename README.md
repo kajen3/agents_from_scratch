@@ -86,20 +86,6 @@ uv run agents-tui     # or: uv run python -m agents_from_scratch.tui
 Enter sends, PgUp/PgDn scroll the conversation, Ctrl+C quits. The CLI
 (`agents-from-scratch`, `--prompt`, `--max-turns`) is unchanged.
 
-## TUI
-
-An interactive terminal UI built with [Textual](https://textual.textualize.io/):
-conversation on the left, a live list of bash calls on the right (amber while
-running, green on exit code 0, red on failure or timeout), a status line, and a
-message box. Like the CLI, run it inside the container.
-
-```sh
-uv run agents-tui     # or: uv run python -m agents_from_scratch.tui
-```
-
-Enter sends, PgUp/PgDn scroll the conversation, Ctrl+C quits. The CLI
-(`agents-from-scratch`, `--prompt`, `--max-turns`) is unchanged.
-
 ## Run the agent
 
 The agent runs in a hardened container. It works on an independent clone of
