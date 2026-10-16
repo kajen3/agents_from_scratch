@@ -9,6 +9,8 @@ emits <exit> or the turn budget runs out.
 import argparse
 import re
 import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TypedDict, cast
 
 import httpx2
@@ -26,6 +28,38 @@ MAX_OUTPUT_CHARS = 2000  # tool output is context we pay for on every later turn
 class Message(TypedDict):
     role: str
     content: str
+
+
+@dataclass(frozen=True)
+class TurnStart:
+    turn: int
+    max_turns: int
+
+
+@dataclass(frozen=True)
+class AssistantMessage:
+    content: str
+
+
+@dataclass(frozen=True)
+class ToolStart:
+    command: str
+
+
+@dataclass(frozen=True)
+class ToolEnd:
+    command: str
+    exit_code: int | None  # None: the command timed out or could not be run
+    output: str  # full, untruncated; the model only sees MAX_OUTPUT_CHARS of it
+
+
+@dataclass(frozen=True)
+class Final:
+    answer: str
+
+
+AgentEvent = TurnStart | AssistantMessage | ToolStart | ToolEnd | Final
+EventCallback = Callable[[AgentEvent], None]
 
 
 SYSTEM_PROMPT = """You are an autonomous coding agent. You solve the user's task by taking one action at a time: you act, observe the result, then decide the next action.
@@ -121,18 +155,26 @@ def parse_action(text: str) -> dict[str, list[str]]:
     return {"exit": ["No action"]}
 
 
-def run_agent(messages: list[Message], max_turns: int) -> tuple[str, list[Message]]:
+def run_agent(
+    messages: list[Message],
+    max_turns: int,
+    on_event: EventCallback | None = None,
+) -> tuple[str, list[Message]]:
+    """Run the loop; report progress through `on_event` instead of printing."""
+
+    def emit(event: AgentEvent) -> None:
+        if on_event is not None:
+            on_event(event)
+
     for turn in range(max_turns):
-        if use_color():
-            print(f"{GREY}Turn: {turn}/{max_turns}{RESET}")
-        else:
-            print(f"Turn: {turn}/{max_turns}")
+        emit(TurnStart(turn, max_turns))
         response = llm_call(messages)
-        # print(response)  # the model speaking: the one moment worth watching
+        emit(AssistantMessage(response))
         messages.append({"role": "assistant", "content": response})
 
         action = parse_action(response)
         if "exit" in action:
+            emit(Final(action["exit"][0]))
             return action["exit"][0], messages
         if "error" in action:
             # The model mixed action types; tell it why and let it retry.
@@ -143,25 +185,41 @@ def run_agent(messages: list[Message], max_turns: int) -> tuple[str, list[Messag
             # back together in a single observation message.
             observations: list[str] = []
             for command in action["bash"]:
-                # Show the user which tool is being invoked, in dim grey.
-                if use_color():
-                    print(f"{GREY}$ {command}{RESET}")
-                else:
-                    print(f"$ {command}")
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    timeout=120,
-                )
+                emit(ToolStart(command))
+                try:
+                    result = subprocess.run(
+                        command,
+                        shell=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        timeout=120,
+                    )
+                except Exception as e:
+                    # Every ToolStart gets a ToolEnd, then fail as before.
+                    emit(ToolEnd(command, None, str(e)))
+                    raise
+                emit(ToolEnd(command, result.returncode, result.stdout))
                 observations.append(
                     f"Output of `$ {command}`:\n{result.stdout[:MAX_OUTPUT_CHARS]}\n(exit code {result.returncode})"
                 )
             messages.append({"role": "user", "content": "\n\n".join(observations)})
 
-    return f"Ran out of turns ({max_turns}) without an <exit> action.", messages
+    answer = f"Ran out of turns ({max_turns}) without an <exit> action."
+    emit(Final(answer))
+    return answer, messages
+
+
+def print_event(event: AgentEvent) -> None:
+    """Terminal rendering of agent events: turn and tool lines in dim grey."""
+    match event:
+        case TurnStart(turn, max_turns):
+            line = f"Turn: {turn}/{max_turns}"
+        case ToolStart(command):
+            line = f"$ {command}"
+        case _:
+            return
+    print(f"{GREY}{line}{RESET}" if use_color() else line)
 
 
 def main(prompt: str | None, max_turns: int) -> None:
@@ -172,7 +230,7 @@ def main(prompt: str | None, max_turns: int) -> None:
 
     if prompt:
         messages.append({"role": "user", "content": prompt})
-        answer, _ = run_agent(messages, max_turns=max_turns)
+        answer, _ = run_agent(messages, max_turns=max_turns, on_event=print_event)
         print("\n" + answer + "\n")
     else:
         print_banner(MODEL)  # interactive only; keeps -p output pipe-clean
@@ -182,7 +240,9 @@ def main(prompt: str | None, max_turns: int) -> None:
                 stop = True
             else:
                 messages.append({"role": "user", "content": prompt})
-                answer, messages = run_agent(messages, max_turns=max_turns)
+                answer, messages = run_agent(
+                    messages, max_turns=max_turns, on_event=print_event
+                )
                 print("\n" + answer + "\n")
 
 
